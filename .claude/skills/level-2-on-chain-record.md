@@ -5,7 +5,9 @@ title: On-Chain Record — AI context
 
 # Context for Claude / AI pair
 
-You are helping a developer complete **Level 2: On-Chain Record** of the Rock Paper Scissors tutorial.
+You are helping a developer complete **Level 2: On-Chain Record**.
+
+Read [00-overview.md](00-overview.md) first for the SDK package set and invariants.
 
 ## Goal
 
@@ -24,7 +26,7 @@ Paseo Next v2 (v1 retired 2026-05-20):
 The repo does NOT use `@parity/product-sdk-bulletin` directly. It uses the **host's preimage manager** because Polkadot Desktop has an optimized path: upload bytes via `preimageManager.submit(bytes)`, host turns them into a Bulletin extrinsic + IPFS pin. This works in dev mode (where opening an Asset Hub chain client is awkward) and avoids spinning up a second chain client just for Bulletin.
 
 ```ts
-import { preimageManager, requestPermission } from "@novasamatech/product-sdk";
+import { preimageManager, requestPermission } from "@novasamatech/host-api-wrapper";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { CID } from "multiformats/cid";
 import * as raw from "multiformats/codecs/raw";

@@ -5,7 +5,9 @@ title: Multiplayer — AI context
 
 # Context for Claude / AI pair
 
-You are helping a developer complete **Level 4: Multiplayer** of the Rock Paper Scissors tutorial.
+You are helping a developer complete **Level 4: Multiplayer**.
+
+Read [00-overview.md](00-overview.md) first for the SDK package set and invariants.
 
 ## Goal
 
@@ -13,13 +15,11 @@ Two accounts play a real-time best-of-3 over Statement Store using commit-reveal
 
 ## Dependency
 
-`@parity/product-sdk-statement-store@^0.2.3` (host mode required — same host the Level 1 signer goes through).
-
-```json
-"@parity/product-sdk-statement-store": "^0.2.3"
-```
-
-Builds on top of `@novasamatech/product-sdk` 0.7.9-4 + Polkadot Desktop ≥ 0.3.10.
+`@parity/product-sdk-statement-store` (latest — do not pin). Host mode required —
+same host the Level 1 signer goes through. Builds on `@novasamatech/host-api-wrapper`
++ Polkadot Desktop ≥ 0.7.5. The `StatementStoreClient` API (constructor config,
+`connect`/`publish`/`subscribe`/`destroy`, `ReceivedStatement.data`) is stable
+across recent versions, so a fresh install on latest needs no code change.
 
 ## Connection pattern (current SDK)
 
@@ -37,7 +37,10 @@ await client.connect({
 });
 ```
 
-`account.productAccountId` is set up in `utils.ts` from `getProductIdentifier()` → typically `["<name>.dot", 0]`. Don't pass `["rps-game.dot", 0]` literal — the identifier varies per gateway (`.dot`, `.paseo.li`, `.dotli.dev`, localhost preview, etc.) and must match what the host signed off on at account creation.
+`account.productAccountId` is `[window.location.host, derivationIndex]`, set up in
+`utils.ts` from `getProductIdentifier()`. Don't pass a literal like
+`["rps-game.dot", 0]` — the identifier is the raw host and must match what the
+host signed off on at account creation (same invariant as the Level 1 signer).
 
 ## Publish / subscribe
 

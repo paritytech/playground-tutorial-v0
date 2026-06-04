@@ -5,191 +5,268 @@ title: The Leaderboard — AI context
 
 # Context for Claude / AI pair
 
-You are helping a developer complete **Level 3: The Leaderboard** of the Rock Paper Scissors tutorial.
+You are helping a developer complete **Level 3: The Leaderboard**.
+
+Read [00-overview.md](00-overview.md) first — it covers the SDK package set,
+the network, the registry, and the five critical invariants. This file is the
+contract + deploy specifics.
 
 ## Goal
 
-Deploy a Rust/PVM contract on **Paseo Asset Hub Next** that indexes players by H160 address. Contract stores `(cid, points)` per player; game JSON itself stays on Bulletin from Level 2.
+Deploy a Rust/PVM contract on **Paseo Asset Hub Next** that indexes players by
+address. The contract stores `(cid, points)` per player; the game JSON itself
+stays on Bulletin (Level 2). The contract is the index; Bulletin is the data.
 
-## Network
+## Toolchain
 
-Paseo Next v2:
+- `rustup`
+- `cargo-pvm-contract` (the `pvm-contract-sdk` contract builder). Install the
+  latest from the release; if it still documents an SDK branch, use the current
+  one (`sm/cdm`), not any legacy `charles/cdm-integration` branch:
+  ```sh
+  HOST_TARGET=$(rustc -vV | awk '/^host:/ {print $2}')
+  cargo install --force --locked --target "$HOST_TARGET" \
+    --git https://github.com/paritytech/cargo-pvm-contract.git --branch sm/cdm \
+    cargo-pvm-contract
+  ```
+  (Use the crates.io release once published.)
+- `cdm` CLI (latest). The current `cdm` takes `--registry-address` as a
+  first-class flag — there is **no** binary-patched `cdm-paseo-next` and **no**
+  vendored `contract-registry` crate anymore. If you see those in old notes,
+  ignore them; the flat-CDM registry already exists on v2.
+- A funded, mapped account: `cdm account set` imports a mnemonic to
+  `~/.cdm/accounts.json`; `cdm account bal -n paseo` checks PAS + Bulletin
+  allowance; `cdm account map -n paseo` does the one-time Revive mapping
+  (required before the first deploy). Fund via
+  `https://faucet.polkadot.io/?parachain=1500`.
 
-- **Asset Hub Next**: `wss://paseo-asset-hub-next-rpc.polkadot.io` (genesis `0x173cea9df45656cf612c8b8ece56e04e9a693c69cfaac47d3628dae735067af8`)
-- **Bulletin Next**: `wss://paseo-bulletin-next-rpc.polkadot.io`
-- **ContractRegistry on v2**: `0x0afb53bf7650f71a8a09f1a6f654fbe59e166195` (freshly bootstrapped — not the v1 registry that the stock `cdm` binary still has hardcoded)
+## Cargo manifests
 
-## Prerequisite check
+**Workspace `Cargo.toml`** — one SDK dependency:
 
-Before writing code, confirm the dev has:
+```toml
+[workspace.dependencies]
+pvm-contract-sdk = { git = "https://github.com/paritytech/cargo-pvm-contract", branch = "sm/cdm", features = ["alloc"] }
+polkavm-derive = "0.31"
+picoalloc = "5.2"
+```
 
-- `rustup` installed
-- `cdm` CLI installed and on PATH **AND** the binary-patched `cdm-paseo-next` alongside it (see "cdm workarounds" below — stock 0.1.0 points at the old Paseo registry)
-- Funded account on **both** chains:
-  - Asset Hub Next (ParaID 1500): `https://faucet.polkadot.io/?parachain=1500`
-  - Bulletin Next (ParaID 1501): `https://faucet.polkadot.io/?parachain=1501`
-- Same mnemonic / address on both. `cdm init -n paseo` generates the keypair to `~/.cdm/accounts.json`.
+No `cdm`, `pvm_contract`, or `parity-scale-codec` unless the contract starts
+importing other CDM packages (`cdm::import!`) or adds SCALE structs.
 
-## Contract shape (`contracts/leaderboard/lib.rs`)
+**`contracts/leaderboard/Cargo.toml`** — the package name lives in Cargo
+metadata, NOT in the Rust macro:
+
+```toml
+[features]
+abi-gen = ["pvm-contract-sdk/abi-gen"]
+
+[package.metadata.cdm]
+package = "@rps/leaderboard"
+
+[dependencies]
+pvm-contract-sdk = { workspace = true }
+polkavm-derive = { workspace = true }
+picoalloc = { workspace = true }
+```
+
+Package names are globally owned in the registry — use an app-specific
+namespace (`@rps/leaderboard`), not `@example/...`.
+
+## Contract shape — receiver-based SDK (`contracts/leaderboard/lib.rs`)
+
+The macro is `#[pvm_contract_sdk::contract(...)]` on a module with a storage
+`struct` (slots via `#[slot(N)]`), an `impl` with `#[constructor]` / `#[method]`
+receivers (`&self` / `&mut self`), and typed errors via `sol_revert_enum!`.
+Return `Address` (encodes as Solidity `address`), not `[u8; 20]`/`bytes20`.
 
 ```rust
-#[pvm::storage]
-struct Storage {
-    player_count: u64,
-    player_at: Mapping<u64, [u8; 20]>,
-    is_registered: Mapping<[u8; 20], bool>,
-    player_cid: Mapping<[u8; 20], String>,
-    player_points: Mapping<[u8; 20], i64>,
-}
+#![cfg_attr(not(feature = "abi-gen"), no_main, no_std)]
 
-#[pvm::contract(cdm = "@example/leaderboard")]
+#[pvm_contract_sdk::contract(allocator = "pico", allocator_size = 4096)]
 mod leaderboard {
-    fn register() -> u64 { /* ... */ }
-    fn update_result(new_cid: String, points_delta: i64) { /* ... */ }
-    fn get_player_count() -> u64 { /* ... */ }
-    fn get_player_at(index: u64) -> [u8; 20] { /* ... */ }
-    fn get_player_cid(player: [u8; 20]) -> String { /* ... */ }
-    fn get_player_points(player: [u8; 20]) -> i64 { /* ... */ }
-    fn is_registered(player: [u8; 20]) -> bool { /* ... */ }
+    use alloc::string::String;
+    use pvm_contract_sdk::{Address, HostApi, Lazy, Mapping};
+
+    pvm_contract_sdk::sol_revert_enum! {
+        pub enum Error {
+            AlreadyRegistered(AlreadyRegistered),
+            NotRegistered(NotRegistered),
+            IndexOutOfBounds(IndexOutOfBounds),
+        }
+    }
+    #[derive(Debug, pvm_contract_sdk::SolError)] pub struct AlreadyRegistered;
+    #[derive(Debug, pvm_contract_sdk::SolError)] pub struct NotRegistered;
+    #[derive(Debug, pvm_contract_sdk::SolError)] pub struct IndexOutOfBounds;
+
+    pub struct Leaderboard {
+        #[slot(0)] player_count: Lazy<u64>,
+        #[slot(1)] player_at: Mapping<u64, [u8; 20]>,
+        #[slot(2)] is_registered: Mapping<[u8; 20], bool>,
+        #[slot(3)] player_cid: Mapping<[u8; 20], String>,
+        #[slot(4)] player_points: Mapping<[u8; 20], i64>,
+    }
+
+    impl Leaderboard {
+        #[pvm_contract_sdk::constructor]
+        pub fn new(&mut self) { self.player_count.set(&0); }
+
+        #[pvm_contract_sdk::method]
+        pub fn register(&mut self) -> Result<u64, Error> {
+            let caller = self.caller();
+            if self.is_registered.get(&caller.0) { return Err(AlreadyRegistered.into()); }
+            let idx = self.player_count.get();
+            self.player_at.insert(&idx, &caller.0);
+            self.is_registered.insert(&caller.0, &true);
+            self.player_points.insert(&caller.0, &0);
+            self.player_count.set(&(idx + 1));
+            Ok(idx)
+        }
+
+        #[pvm_contract_sdk::method]
+        pub fn update_result(&mut self, new_cid: String, points_delta: i64) -> Result<(), Error> {
+            let caller = self.caller();
+            if !self.is_registered.get(&caller.0) { return Err(NotRegistered.into()); }
+            self.player_cid.insert(&caller.0, &new_cid);
+            let current = self.player_points.get(&caller.0);
+            self.player_points.insert(&caller.0, &(current + points_delta));
+            Ok(())
+        }
+
+        #[pvm_contract_sdk::method]
+        pub fn get_player_at(&self, index: u64) -> Result<Address, Error> {
+            if index >= self.player_count.get() { return Err(IndexOutOfBounds.into()); }
+            Ok(Address(self.player_at.get(&index)))
+        }
+
+        // get_player_count() -> u64; get_player_cid(Address) -> String;
+        // get_player_points(Address) -> i64; is_registered(Address) -> bool
+        // ... same receiver pattern ...
+
+        fn caller(&self) -> Address {
+            let mut buf = [0u8; 20];
+            self.host().caller(&mut buf);
+            Address(buf)
+        }
+    }
 }
 ```
 
-## cdm workarounds (current, until upstream ships 0.2.x)
+`cargo pvm-contract build` writes `target/release/leaderboard.polkavm` and
+`leaderboard.abi.json` — confirm the ABI shows `getPlayerAt() -> address`,
+`getPlayerCid(address)`, etc., and `register` as `nonpayable`.
 
-`cdm 0.1.0` has the ContractRegistry address hardcoded into the binary at `0xae344f7f0f91d3a2176032af2990abcc7606c7d4` — that contract only exists on the retired Paseo v1, so plain `cdm deploy -n paseo` against v2 RPCs fails with `Contract 0xae34… not found`.
+## Build + deploy flow (from scratch)
 
-**The repo ships these workarounds — don't reinvent them:**
+```sh
+# 1. compile the contract
+cargo pvm-contract build --manifest-path Cargo.toml -p leaderboard
 
-1. **A binary-patched copy** of `cdm` lives at `~/.local/bin/cdm-paseo-next`, with the registry constant replaced by `0x0afb53bf7650f71a8a09f1a6f654fbe59e166195` (the freshly-bootstrapped registry on v2). Patch script: in-place byte replace (both addresses are 40 hex chars, identical length) + `codesign --force --sign -` to re-sign after edit so macOS Gatekeeper doesn't kill it.
+# 2. regenerate the CDM manifest from the new package metadata
+rm -rf .cdm cdm.json
+cdm build
 
-2. **`contracts/contract-registry/`** holds a copy of the registry crate source (taken from `~/.cargo/git/checkouts/contract-dependency-manager-…/src/contract`). Needed once during `cdm deploy --bootstrap` to build the registry. After bootstrap, it's `exclude`-d from the Cargo workspace so subsequent `cdm deploy` runs don't try to redeploy it alongside the leaderboard (would cause nonce-stale collisions).
+# 3. map the signing account on Revive (idempotent; needed before first deploy)
+cdm account map -n paseo
 
-3. **`package.json` deploy script**:
+# 4. deploy + register into the flat-CDM registry
+npm run deploy        # = cdm deploy -n paseo --registry-address 0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0 \
+                      #     --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io \
+                      #     --bulletin-url  wss://paseo-bulletin-next-rpc.polkadot.io
 
-    ```json
-    "deploy": "cdm deploy -n paseo --registry-address 0x0afb53bf7650f71a8a09f1a6f654fbe59e166195 --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io --bulletin-url wss://paseo-bulletin-next-rpc.polkadot.io"
-    ```
-
-    (`--registry-address` was added by a later cdm patch; if your CLI doesn't accept it, fall back to `cdm-paseo-next` binary.)
-
-When upstream ships a `cdm` that accepts `--registry-address` as a first-class flag, you can drop both the binary patch and the vendored crate.
-
-## Build + deploy flow
-
-```bash
-cdm build                # builds leaderboard PVM
-npm run deploy           # uses paseo-next RPCs + registry override
+# 5. read the deployed address/abi back from the registry into cdm.json
+cdm i -n paseo --registry-address 0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0 \
+  --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io \
+  --ipfs-gateway-url https://paseo-bulletin-next-ipfs.polkadot.io/ipfs @rps/leaderboard
 ```
 
-`cdm deploy` writes the contract address into `cdm.json` under `contracts["acc2c3b5e912b762"]["@example/leaderboard"].address`. The target key `acc2c3b5e912b762` is the same on both Paseo v1 and v2 — only the RPC URLs inside `targets[].asset-hub` / `targets[].bulletin` differ.
+The resulting `cdm.json` is the **flat** shape — top-level `registry`,
+`dependencies: { "@rps/leaderboard": "latest" }`, and `contracts["@rps/leaderboard"]`
+with `version`, `address`, `abi`, `metadataCid`. There is **no** `targets` block
+and **no** target-hash key (`acc2c3b5…`) — those were the old shape.
 
-## Frontend integration (current SDK)
+## Frontend integration
+
+`src/utils.ts` lazy-inits the contract on first method call (holding a chain
+follow open at startup starves Bulletin preimage submits). The init **must map
+the account before resolving live addresses** — `fromLiveClient` immediately
+queries the registry, and an unmapped origin fails with `AccountUnmapped`:
 
 ```ts
-import { ContractManager, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
+import {
+  ContractManager, createContractRuntimeFromClient, ensureContractAccountMapped,
+} from "@parity/product-sdk-contracts";
 import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
-import { ss58ToH160 } from "@parity/product-sdk-address";
-import { createClient, createPapiProvider } from "polkadot-api";
-import { getWsProvider } from "@polkadot-api/ws-provider";
-import cdmJson from "../cdm.json";
 
-// PAPI client — host-routed in prod, direct WS in dev (localhost). The host refuses
-// to open a chain follow for an unregistered domain even though `host_feature_supported`
-// returns true, so for dev we bypass `createPapiProvider` and go straight to WS.
-const isDevHost = /^localhost(:\d+)?$/.test(window.location.host);
-const PASEO_ASSET_HUB_WS = "wss://paseo-asset-hub-next-rpc.polkadot.io";
-const PASEO_ASSET_HUB_GENESIS = "0x173cea9df45656cf612c8b8ece56e04e9a693c69cfaac47d3628dae735067af8";
-
-const provider = isDevHost
-    ? getWsProvider(PASEO_ASSET_HUB_WS)
-    : createPapiProvider(PASEO_ASSET_HUB_GENESIS, getWsProvider(PASEO_ASSET_HUB_WS));
-const client = createClient(provider);
-
-// IMPORTANT: wake the chain follow before passing the client to ContractManager.
-// PAPI's chain-head subscription is lazy — the first storage query throws
-// "No active follow for this chain" until something touches the client.
 await client.getChainSpecData();
-await client.getBestBlocks();
+await client.getBestBlocks();           // wake the chain follow first
 
-// Build the manager. SDK 0.5 dropped @polkadot-api/sdk-ink — use `fromClient`,
-// which builds a ContractRuntime internally that wires the typed API (for
-// extrinsics + storage) and the unsafe API (for the ReviveApi.call dry-run,
-// sidesteps compat-token drift if descriptor lags a runtime upgrade).
-const contractManager = ContractManager.fromClient(
-    cdmJson,
-    client,
-    paseo_asset_hub,
-    { defaultOrigin: account.address, defaultSigner: account.signer },
+// 1. map the connected product account (plain runtime, no registry query)
+const initRuntime = createContractRuntimeFromClient(client, paseo_asset_hub);
+await ensureContractAccountMapped(initRuntime, account.address, account.signer);
+
+// 2. NOW resolve live addresses from the registry
+const manager = await ContractManager.fromLiveClient(
+  cdmJson, client, paseo_asset_hub,
+  {
+    defaultOrigin:  account.address,
+    defaultSigner:  account.signer,
+    registryOrigin: account.address,        // also a query origin → must be mapped
+    libraries: ["@rps/leaderboard"],
+  },
 );
-const lb = contractManager.getContract("@example/leaderboard");
+const lb = manager.getContract("@rps/leaderboard");
 
-// Query (read-only) — `.query(...args)` returns `{ success, value, gasRequired }`.
-const cidRes = await lb.getPlayerCid.query(asBytes20(account));
-if (!cidRes.success) throw new Error("query failed");
-const cid: string = cidRes.value;
-
-// Tx (write) — uses defaultSigner/defaultOrigin from setDefaults; no need to
-// pass `{ signer, origin }` per call.
-await lb.register.tx();
-await lb.updateResult.tx(newCid, BigInt(pointsDelta));
+// queries return { success, value, gasRequired }; pass 0x… hex for address args
+const res = await lb.getPlayerCid.query(asAddress(account));
+await lb.register.tx();                                   // returns Result<u64, Error>
+await lb.updateResult.tx(newCid, BigInt(pointsDelta));    // returns Result<(), Error>
 ```
 
-### Account mapping is mandatory on Paseo Next v2
-
-```ts
-// Before any contract call from a freshly-created product account:
-const mapped = await ensureContractAccountMapped(
-    contractManager.getRuntime(),
-    account.address,
-    account.signer,
-);
-// mapped === null → already mapped (free)
-// mapped !== null → first-time map_account() tx landed in block #mapped.block.number
-```
-
-This **must** be called per-account on first contract interaction. pallet-revive on v2 rejects `Revive.call` from any SS58 origin that hasn't been mapped to its derived H160 — the old desktop-side pre-mapping shortcut from v1 is gone.
-
-## `asBytes20` helper
-
-```ts
-export function asBytes20(hexOrAccount: string | AppAccount): `0x${string}` {
-    const hex = typeof hexOrAccount === "string" ? hexOrAccount : hexOrAccount.h160Address;
-    return (hex.startsWith("0x") ? hex : `0x${hex}`) as `0x${string}`;
-}
-```
-
-sdk-ink's encoder accepted either `0x…` hex strings or `Binary` instances. SDK 0.5 contracts is stricter — pass the hex string only. Don't construct `FixedSizeBinary<20>` / `Binary` wrappers; cross-realm class identity issues bite when multiple substrate-bindings versions hoist into `node_modules`.
-
-## Lazy contract init pattern
-
-The repo defers `createClient(...)` until the first contract method call (`stageCdmJson(cdmJson)` plants the manifest, `ensureContractsReady()` does the actual init). Reason: holding an Asset Hub chain follow open at app startup competes with Bulletin preimage submits and can starve the host's connection pool. If you're adding new pages that hit the contract, follow the same pattern via `getContract()` — it returns a proxy that defers init until method invocation.
-
-## Wake-on-touch wrapper
-
-Each contract method handle is wrapped so `.query()` / `.tx()` first calls `wakeChainFollow()` (a no-op `client.getBestBlocks()`) and retries once on `"No active follow for this chain"`. The host tears down the chain follow when the tab is backgrounded long enough — without this retry, the first call after wake bombs. Same trick t3rminal uses.
+`asAddress(hexOrAccount)` returns a `0x…` H160 string (the encoder accepts it
+for the `address` type). Don't build `Binary`/`FixedSizeBinary` — cross-realm
+class identity breaks when substrate-bindings hoists multiple copies.
+`asBytes20` is kept as a deprecated alias.
 
 ## Common gotchas
 
-- **`PJS does not support this signed-extension`** in console = the signer was built with `signerType: "signPayload"` (the default). Fix: pass `"createTransaction"` as the second arg to `getProductAccountSigner` — see [level-1](level-1-local-challenger.md) for the full signer setup.
-- **`AccountUnmapped` from `Revive`** = `ensureContractAccountMapped` not called before the first contract tx. The Level 1 comment that "product accounts are pre-mapped on the host side" is **wrong on Paseo Next v2** — has to be called explicitly.
-- **`DuplicateContract` from `cdm deploy`** is harmless — the contract address is deterministic (deployer + salt + code → same address). On a re-deploy after a successful one, it just means "already there".
-- **`Invalid::Stale`** during deploy = nonce collision. Most often caused by `cdm` trying to deploy both `contract-registry` and `@example/leaderboard` in parallel because both ended up as workspace members. Fix: keep `exclude = ["contracts/contract-registry"]` in `Cargo.toml`.
-- **`Invalid::Payment`** = deployer / caller has no PAS on the relevant chain. **Both** chains need funding for the deploy step (Asset Hub for the contract, Bulletin for the metadata upload).
-- **H160 vs SS58**: the contract keys by H160 (`account.h160Address`). Use SS58 (`account.address`) only for `origin` / signing. The `ss58ToH160` helper in `@parity/product-sdk-address` is the canonical derivation — don't roll your own keccak.
-- **Points can be negative** (i64) — losses subtract. Don't use `u64`.
-- **Contract is the index, Bulletin is the data.** Don't put game JSON on-chain — store the CID only.
-- **`register()` must be called once per player** before any `update_result()`. Check `isRegistered()` first; auto-register on first save.
+- **`ContractLiveAddressResolutionError: Failed to resolve live address`** = the
+  registry view query failed, almost always because the query origin isn't
+  Revive-mapped. Map the account *before* `fromLiveClient` (see above). To
+  confirm it's mapping (not a missing registration), a mapped origin returns
+  `{ success: true, value: { isSome: true, value: "0x…" } }` while an unmapped
+  one returns `success: false → Revive::AccountUnmapped`.
+- **`permission denied {expected: 'localhost:3000', got: '...dot'}`** = the
+  product identifier diverged from the host context. Use `window.location.host`
+  verbatim (invariant #1 in the overview).
+- **`PJS does not support this signed-extension`** = signer built without
+  `"createTransaction"`.
+- **`DuplicateContract`** on re-deploy is harmless (deterministic address).
+- **`Invalid::Payment`** = the deployer needs PAS (Asset Hub for the contract,
+  Bulletin allowance for the metadata upload).
+- **H160 vs SS58**: the contract keys by H160 (`account.h160Address`); SS58
+  (`account.address`) is only for origin/signing. Use `ss58ToH160` — don't roll
+  your own keccak.
+- **Points are `i64`** (losses subtract). **`register()` once per player** before
+  any `update_result()` — check `isRegistered()` and auto-register on first save.
 
 ## Acceptance check
 
-- `npm run deploy` succeeds against Paseo Next v2; address written to `cdm.json`
-- New player triggers one `Revive.map_account()` tx, then one `register()` call, then `update_result()` per match
-- Switching browsers with the same account pulls points from the contract and games from Bulletin
-- Leaderboard page lists all registered players sorted by points
+- `cargo pvm-contract build` + `cdm build` + `npm run deploy` + `cdm i` succeed;
+  `cdm.json` has the flat shape with the registry and `@rps/leaderboard` address.
+- A fresh player triggers one `Revive.map_account()` signature, then `register()`,
+  then `update_result()` per match.
+- Page refresh resolves the current address live from the registry.
+- Leaderboard lists registered players sorted by points.
 
 ## Do NOT
 
-- Don't add multiplayer yet — Level 4
-- Don't try to store game round data on-chain — too expensive, stays on Bulletin
-- Don't import `@polkadot-api/sdk-ink` — it was dropped in `@parity/product-sdk-contracts` 0.4. Use `ContractManager.fromClient(...)`.
-- Don't construct contract addresses by hand; let `cdm deploy` write to `cdm.json` and read from there
+- Don't use the old `#[pvm::storage]` / `#[pvm::contract(cdm = "...")]` macro —
+  that's the legacy SDK. Use `#[pvm_contract_sdk::contract]` with receivers.
+- Don't return `bytes20`; return `Address`.
+- Don't use `ContractManager.fromClient` (snapshot) unless you intentionally want
+  the installed address — the app wants live resolution.
+- Don't import `@polkadot-api/sdk-ink` — dropped from product-sdk-contracts.
+- Don't reintroduce the cdm 0.1.0 binary patch or vendored `contract-registry`
+  crate — the flat-CDM registry exists and `--registry-address` is supported.
+- Don't construct contract addresses by hand; deploy writes them into `cdm.json`.
