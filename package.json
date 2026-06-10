@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@novasamatech/host-api": "^0.8.6",
+    "@novasamatech/host-api-wrapper": "^0.8.6",
     "@parity/product-sdk-host": "^0.8.0",
     "@parity/product-sdk-signer": "^0.6.3",
     "react": "^19.0.0",
